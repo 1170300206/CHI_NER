@@ -8,6 +8,7 @@ import copy
 import numpy as np
 
 import torch
+import torchsnooper
 import torch.nn.functional as F
 from torch import nn
 
@@ -21,10 +22,10 @@ def log_sum_exp(vec):
     return result.squeeze(1)
 
 class BiLSTMCRF(nn.Module):
-
+    use_gpu = False
     def __init__(
             self, 
-            tag_map={"O":0, "B-COM":1, "I-COM":2, "E-COM":3, "START":4, "STOP":5},
+            tag_map={"O":0, "B-OPI":1, "I-OPI":2, "E-OPI":3, "B-ASP":4, "I-ASP":5, "E-ASP":6,"START":7, "STOP":8},
             batch_size=20,
             vocab_size=20,
             hidden_dim=128,
@@ -40,7 +41,6 @@ class BiLSTMCRF(nn.Module):
         
         self.tag_size = len(tag_map)
         self.tag_map = tag_map
-        
         self.transitions = nn.Parameter(
             torch.randn(self.tag_size, self.tag_size)
         )
@@ -52,10 +52,14 @@ class BiLSTMCRF(nn.Module):
                         num_layers=1, bidirectional=True, batch_first=True, dropout=self.dropout)
         self.hidden2tag = nn.Linear(self.hidden_dim, self.tag_size)
         self.hidden = self.init_hidden()
+        #self.use_gpu = torch.cuda.is_available()
 
     def init_hidden(self):
+        if(self.use_gpu):
+            return (torch.randn(2, self.batch_size, self.hidden_dim // 2).cuda(),
+            torch.randn(2, self.batch_size, self.hidden_dim // 2).cuda())
         return (torch.randn(2, self.batch_size, self.hidden_dim // 2),
-                torch.randn(2, self.batch_size, self.hidden_dim // 2))
+            torch.randn(2, self.batch_size, self.hidden_dim // 2))
 
     def __get_lstm_features(self, sentence):
         self.hidden = self.init_hidden()
@@ -65,12 +69,15 @@ class BiLSTMCRF(nn.Module):
         lstm_out, self.hidden = self.lstm(embeddings, self.hidden)
         lstm_out = lstm_out.view(self.batch_size, -1, self.hidden_dim)
         logits = self.hidden2tag(lstm_out)
-        return logits
+        return logits #cuda() change
     
     def real_path_score_(self, feats, tags):
         # Gives the score of a provided tag sequence
         score = torch.zeros(1)
-        tags = torch.cat([torch.tensor([self.tag_map[START_TAG]], dtype=torch.long), tags])
+        if(self.use_gpu):
+            tags = torch.cat([torch.tensor([self.tag_map[START_TAG]], dtype=torch.long).cuda(), tags])
+        else:
+            tags = torch.cat([torch.tensor([self.tag_map[START_TAG]], dtype=torch.long), tags])
         for i, feat in enumerate(feats):
             score = score + \
                 self.transitions[tags[i], tags[i+1]] + feat[tags[i + 1]]
@@ -86,9 +93,12 @@ class BiLSTMCRF(nn.Module):
         Score = Emission_Score + Transition_Score  
         Emission_Score = logits(0, label[START]) + logits(1, label[1]) + ... + logits(n, label[STOP])  
         Transition_Score = Trans(label[START], label[1]) + Trans(label[1], label[2]) + ... + Trans(label[n-1], label[STOP])  
-        '''
+        ''' 
         score = torch.zeros(1)
-        label = torch.cat([torch.tensor([self.tag_map[START_TAG]], dtype=torch.long), label])
+        if(self.use_gpu):
+            label = torch.cat([torch.tensor([self.tag_map[START_TAG]], dtype=torch.long).cuda(), label])
+        else:
+            label = torch.cat([torch.tensor([self.tag_map[START_TAG]], dtype=torch.long), label])
         for index, logit in enumerate(logits):
             emission_score = logit[label[index + 1]]
             transition_score = self.transitions[label[index], label[index + 1]]
@@ -107,6 +117,8 @@ class BiLSTMCRF(nn.Module):
         """
         obs = []
         previous = torch.full((1, self.tag_size), 0)
+        if(self.use_gpu):
+            previous = previous.cuda()
         for index in range(len(logits)): 
             previous = previous.expand(self.tag_size, self.tag_size).t()
             obs = logits[index].view(1, -1).expand(self.tag_size, self.tag_size)
@@ -137,6 +149,8 @@ class BiLSTMCRF(nn.Module):
         :params lengths represent the ture length of sentence, the default is sentences.size(-1)
         """
         sentences = torch.tensor(sentences, dtype=torch.long)
+        if(self.use_gpu):
+            sentences = sentences.cuda()
         if not lengths:
             lengths = [i.size(-1) for i in sentences]
         self.batch_size = sentences.size(0)
@@ -154,10 +168,12 @@ class BiLSTMCRF(nn.Module):
         backpointers = []
         trellis = torch.zeros(logits.size())
         backpointers = torch.zeros(logits.size(), dtype=torch.long)
-        
         trellis[0] = logits[0]
         for t in range(1, len(logits)):
-            v = trellis[t - 1].unsqueeze(1).expand_as(self.transitions) + self.transitions
+            a = trellis[t - 1].unsqueeze(1).expand_as(self.transitions)
+            if(self.use_gpu):
+                a = a.cuda()
+            v = a + self.transitions
             trellis[t] = logits[t] + torch.max(v, 0)[0]
             backpointers[t] = torch.max(v, 0)[1]
         viterbi = [torch.max(trellis[-1], -1)[1].cpu().tolist()]

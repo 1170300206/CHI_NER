@@ -9,6 +9,8 @@ import sys
 import yaml
 
 import torch
+import torchsnooper
+import pandas as pd
 import torch.optim as optim
 from data_manager import DataManager
 from model import BiLSTMCRF
@@ -16,10 +18,14 @@ from utils import f1_score, get_tags, format_result
 
 
 class ChineseNER(object):
-    
+    use_gpu = False
     def __init__(self, entry="train"):
         self.load_config()
+        #self.use_gpu = torch.cuda.is_available()
         self.__init_model(entry)
+        print(self.use_gpu)
+        if(self.use_gpu): # gpu加速
+            self.model = self.model.cuda()
 
     def __init_model(self, entry):
         if entry == "train":
@@ -34,7 +40,6 @@ class ChineseNER(object):
             self.save_params(data)
             dev_manager = DataManager(batch_size=30, data_type="dev")
             self.dev_batch = dev_manager.iteration()
-
             self.model = BiLSTMCRF(
                 tag_map=self.train_manager.tag_map,
                 batch_size=self.batch_size,
@@ -99,6 +104,7 @@ class ChineseNER(object):
             data_map = pickle.load(fopen)
         return data_map
 
+    #@torchsnooper.snoop()
     def train(self):
         optimizer = optim.Adam(self.model.parameters())
         # optimizer = optim.SGD(ner_model.parameters(), lr=0.01)
@@ -107,13 +113,17 @@ class ChineseNER(object):
             for batch in self.train_manager.get_batch():
                 index += 1
                 self.model.zero_grad()
-
                 sentences, tags, length = zip(*batch)
                 sentences_tensor = torch.tensor(sentences, dtype=torch.long)
                 tags_tensor = torch.tensor(tags, dtype=torch.long)
                 length_tensor = torch.tensor(length, dtype=torch.long)
-
+                if(self.use_gpu): # gpu加速
+                    sentences_tensor = sentences_tensor.cuda()
+                    tags_tensor = tags_tensor.cuda()
+                    length_tensor = length_tensor.cuda()
                 loss = self.model.neg_log_likelihood(sentences_tensor, tags_tensor, length_tensor)
+                if(self.use_gpu):
+                    loss = loss.cuda()
                 progress = ("█"*int(index * 25 / self.total_size)).ljust(25)
                 print("""epoch [{}] |{}| {}/{}\n\tloss {:.2f}""".format(
                         epoch, progress, index, self.total_size, loss.cpu().tolist()[0]
@@ -125,26 +135,63 @@ class ChineseNER(object):
                 optimizer.step()
                 torch.save(self.model.state_dict(), self.model_path+'params.pkl')
 
+    def get_string(self, x):
+        now = x.split('\n')
+        o = now[1].split(' ')
+        while '' in o:
+            o.remove('')
+        return o[1]
+
     def evaluate(self):
         sentences, labels, length = zip(*self.dev_batch.__next__())
+        if(self.use_gpu):
+            sentences = torch.tensor(sentences, dtype=torch.long).cuda()
         _, paths = self.model(sentences)
         print("\teval")
         for tag in self.tags:
             f1_score(labels, paths, tag, self.model.tag_map)
 
-    def predict(self, input_str=""):
-        if not input_str:
-            input_str = input("请输入文本: ")
-        input_vec = [self.vocab.get(i, 0) for i in input_str]
-        # convert to tensor
-        sentences = torch.tensor(input_vec).view(1, -1)
-        _, paths = self.model(sentences)
+    def predict(self, input_str="", input_path = None):
+        if input_path is not None:
+            tests = pd.read_csv(input_path)
+            with open('output.txt', 'w', encoding='utf-8') as o:
+                #o.write('id,aspect,opinion\n')
+                for ids in range(1, 2235):
+                    input_str = self.get_string(str(tests.loc[ids-1:ids-1, ['Review']]))
+                    index = int(self.get_string(str(tests.loc[ids-1:ids-1, ['id']])))
+                    input_vec = [self.vocab.get(i, 0) for i in input_str]
+                    # convert to tensor
+                    if(self.use_gpu): # gpu加速
+                        sentences = torch.tensor(input_vec).view(1, -1).cuda()
+                    else:
+                        sentences = torch.tensor(input_vec).view(1, -1)
+                    _, paths = self.model(sentences)
 
-        entities = []
-        for tag in self.tags:
-            tags = get_tags(paths[0], tag, self.tag_map)
-            entities += format_result(tags, input_str, tag)
-        return entities
+                    entities = []
+                    for tag in self.tags:
+                        tags = get_tags(paths[0], tag, self.tag_map)
+                        entities += format_result(tags, input_str, tag)
+                    entities = sorted(entities, key=lambda x: x['start'])
+                    #print(str(index) + "  " + input_str + " " +str(len(entities)))
+                    for entity in entities:
+                        #print(entity)
+                        o.write(str(index)+','+entity['type'] +',' + entity['word']+'\n')
+        else:
+            if not input_str:
+                input_str = input("请输入文本: ")
+            input_vec = [self.vocab.get(i, 0) for i in input_str]
+            # convert to tensor
+            if(self.use_gpu): # gpu加速
+                sentences = torch.tensor(input_vec).view(1, -1).cuda()
+            else:
+                sentences = torch.tensor(input_vec).view(1, -1)
+            _, paths = self.model(sentences)
+
+            entities = []
+            for tag in self.tags:
+                tags = get_tags(paths[0], tag, self.tag_map)
+                entities += format_result(tags, input_str, tag)
+            return entities
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -155,4 +202,8 @@ if __name__ == "__main__":
         cn.train()
     elif sys.argv[1] == "predict":
         cn = ChineseNER("predict")
-        print(cn.predict())
+        if len(sys.argv) == 3:
+            cn.predict(input_path=sys.argv[2])
+        else:
+            print(cn.predict())
+

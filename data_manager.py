@@ -54,7 +54,7 @@ class DataManager():
         # covert to one-hot
         sentence = []
         target = []
-        with open(self.data_path) as f:
+        with open(self.data_path, encoding="utf-8") as f:
             for line in f:
                 line = line[:-1]
                 if line == "end":
